@@ -1,3 +1,4 @@
+import { orderedPresetEntries } from './src/agents/preset-application.js';
 import { createSillyTavernHost } from './src/adapters/sillytavern.js';
 import { createSettingsPersistence } from './src/adapters/settings.js';
 import { Controller } from './src/runtime/controller.js';
@@ -6,6 +7,9 @@ import { createTraceStore } from './src/diagnostics/trace-store.js';
 import { installCapture } from './src/diagnostics/capture.js';
 import { createProblemExporter } from './src/diagnostics/problem-export.js';
 import { createFloatingManager } from './src/ui/floating-manager.js';
+
+// Keep in step with manifest.json; test/version.test.js checks it.
+const PLUGIN_VERSION = '0.3.1';
 
 async function boot() {
     if (!globalThis.SillyTavern?.getContext || document.getElementById('dynamic-world-memory')) return;
@@ -37,10 +41,8 @@ async function boot() {
         if (SillyTavern.getContext().mainApi !== 'openai') return { name: '当前连接没有可读取的聊天补全预设', entries: [] };
         const manager = openai.promptManager;
         const order = manager?.getPromptOrderForCharacter?.(manager.activeCharacter) ?? [];
-        const enabled = new Set(order.filter(item => item.enabled).map(item => item.identifier));
         return { name: openai.oai_settings?.preset_settings_openai ?? '',
-            entries: (openai.oai_settings?.prompts ?? []).filter(prompt => !prompt.marker && enabled.has(prompt.identifier))
-                .map(prompt => ({ id: prompt.identifier, title: prompt.name || prompt.identifier, content: prompt.content })) };
+            entries: orderedPresetEntries(openai.oai_settings?.prompts ?? [], order) };
     };
     const extensionSettings = context.extensionSettings ?? (await import('/scripts/extensions.js')).extension_settings;
     const settings = extensionSettings.dwm ?? {};
@@ -115,7 +117,7 @@ async function boot() {
     const problems = createProblemExporter({ controller, context: () => {
         const live = SillyTavern.getContext();
         return { chatId: live.getCurrentChatId?.() ?? live.chatId ?? '', character: live.name2 ?? '', memoryChatId: host.snapshot().chatId,
-            pluginVersion: '0.1.0-alpha.5', mainApi: live.mainApi, browser: navigator.userAgent };
+            pluginVersion: PLUGIN_VERSION, mainApi: live.mainApi, browser: navigator.userAgent };
     } });
     const panel = mountPanel(mount, controller, { exportProblem: () => problems.export() });
     const renderManagerStatus = () => manager.render(controller.uiStatus());
@@ -125,7 +127,7 @@ async function boot() {
     host.bindController(controller);
     await controller.start();
     // Public handle is for explicit local diagnostics. Agent views are built separately.
-    globalThis.DynamicWorldMemory = Object.freeze({ version: '0.1.0-alpha.5', apiVersion: 1,
+    globalThis.DynamicWorldMemory = Object.freeze({ version: PLUGIN_VERSION, apiVersion: 1,
         setContext: input => controller.setContext(input), clearContext: owner => controller.clearContext(owner),
         readScope: scopeId => controller.readScope(scopeId), whenIdle: () => controller.whenIdle(), whenCommitted: () => controller.whenCommitted(),
         ui: Object.freeze({ status: () => controller.uiStatus(), subscribe: fn => controller.subscribe(() => fn(controller.uiStatus())),

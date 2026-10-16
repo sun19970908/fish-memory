@@ -1,3 +1,4 @@
+import { applicationSnapshot, APPLICATION_SCAN, validateApplicationSelection, validateApplicationPositions, selectedApplicationEntries, applyPresetApplication } from '../agents/preset-application.js';
 import { throwIfAborted, combineSignals } from '../platform/abort.js';
 import { sourceBookChanges } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
@@ -7,9 +8,11 @@ import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, templateHint, normalizeTimeout
 import { playerView, scopeRead, memoryMetrics } from '../core/views.js';
 import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
 import { planWindow } from '../core/window.js';
+import { maintenanceFocus } from '../core/focus.js';
 import { applyMaintenance } from '../core/operations.js';
-import { AgentClient, compatibleConnection, untilAborted, serializeAgentInput } from '../agents/client.js';
+import { AgentClient, compatibleConnection, listModels, untilAborted, serializeAgentInput, requestMessages, REASONING_EFFORTS } from '../agents/client.js';
 import { classifyEntries, alignStrategy, maintain, select, compact, mergeSourceUpdates } from '../agents/tasks.js';
+import { prescan, DEFERRED } from '../agents/prescan.js';
 import { discoverRules, compileRules, applyRules, evaluateRules } from '../rules/index.js';
 import { createTraceStore } from '../diagnostics/trace-store.js';
 import { buildPromptPreview } from '../diagnostics/prompt-preview.js';
@@ -44,6 +47,7 @@ export class Controller {
     #pausedPostKeys = new Set();
     #activityClaims = new Map();
     #presetDraft = null;
+    #applicationDraft = null;
     #loading = null;
     #loadedTarget = null;
     #worldbookCheck = null;
@@ -54,6 +58,7 @@ export class Controller {
     #initializationContextFingerprint = '';
     #initializationClassificationFingerprint = '';
     #connectionConfig = null;
+    #modelList = null;
     constructor(host, { model, traces = createTraceStore(), settings = {}, persistSettings = async () => {}, chooseFallback = async () => 'cancel', connectionStore = null } = {}) {
         this.host = host; this.settings = { ...DEFAULT_SETTINGS, ...settings, ...normalizeTimeoutSettings(settings) };
         if (!Number.isInteger(this.settings.maintenanceEvery) || this.settings.maintenanceEvery < 1 || this.settings.maintenanceEvery > MAINTENANCE_EVERY_MAX) this.settings.maintenanceEvery = DEFAULT_SETTINGS.maintenanceEvery;
@@ -78,8 +83,8 @@ export class Controller {
             } catch { /* Keep the ST connection when the stored value is unusable. */ }
         }
     }
-    #applyConnection(mode, { endpoint, model, apiKey = '' } = {}) {
-        const config = { endpoint: String(endpoint ?? '').trim().replace(/\/$/, ''), model: String(model ?? '').trim(), apiKey: String(apiKey ?? '') };
+    #applyConnection(mode, { endpoint, model, apiKey = '', maxOutputTokens } = {}) {
+        const config = { endpoint: String(endpoint ?? '').trim().replace(/\/$/, ''), model: String(model ?? '').trim(), apiKey: String(apiKey ?? ''), maxOutputTokens: maxOutputTokens === '' || maxOutputTokens == null ? undefined : Number(maxOutputTokens) };
         const client = this.#client(['raw', 'tavern'].includes(mode) ? request => this.host.rawGenerate(request) : compatibleConnection(config));
         this.#connectionConfig = ['raw', 'tavern'].includes(mode) ? null : config;
         this.connectionMode = mode; this.client = client;
@@ -91,24 +96,27 @@ export class Controller {
     #instrument(client) {
         const complete = async (request, accept = result => result) => {
             const presetFingerprint = this.#preset().fingerprint, preferences = this.#auxiliaryPreferences();
-            request = applyAuxiliaryPreferences(request, preferences);
+            const application = this.#application(), applicationEntries = this.#applicationEntries();
+            request = applyPresetApplication(applyAuxiliaryPreferences(request, preferences), applicationEntries);
             const epoch = this.#epoch, start = Date.now();
             const serializedInput = serializeAgentInput(request.input);
             let trace = this.host.traceCapture?.register({ ...request, input: serializedInput });
-            const startFallback = input => this.traces.start({ source: '鱼忆', label: ({ initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设偏好', sourceMerge: '合并原书更新' })[request.purpose] ?? request.purpose,
+            const startFallback = input => this.traces.start({ source: '鱼忆', label: ({ initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设应用', sourceMerge: '合并原书更新' })[request.purpose] ?? request.purpose,
                 transport: this.connectionMode === 'test' ? 'test' : 'agent-boundary',
                 context: { chatId: this.host.snapshot().chatId },
-                request: { messages: [{ role: 'system', content: request.system }, { role: 'user', content: input }] },
+                request: { messages: requestMessages({ ...request, input }) },
                 captureNote: '辅助接口记录，未捕获网络包；模拟模式的输出为合成数据。' });
             let fallbackId = trace ? null : startFallback(serializedInput);
+            const wrapChars = [...(request.head ?? []), ...(request.tail ?? [])].reduce((n, m) => n + m.content.length, 0);
             const metric = { task: request.purpose, at: new Date(start).toISOString(),
-                inputChars: request.system.length + serializedInput.length, outputChars: 0, ok: false };
+                inputChars: request.system.length + serializedInput.length + wrapChars, outputChars: 0, ok: false };
             try {
                 throwIfAborted(request.signal);
                 const validate = async result => {
                     metric.outputChars = JSON.stringify(result).length;
                     if (fallbackId) this.traces.update(fallbackId, { responseBody: result });
                     if (preferences.length && request.purpose !== 'preferences') invariant(this.#preset().fingerprint === presetFingerprint, '请求期间预设已改变，旧偏好结果不再采用');
+                    if (applicationEntries.length && request.purpose !== 'preferences') invariant(this.#application().fingerprint === application.fingerprint, '请求期间预设已改变，请重试');
                     return untilAborted(accept(result), request.signal);
                 };
                 const onAttempt = attempt => {
@@ -119,7 +127,7 @@ export class Controller {
                     if (fallbackId) this.traces.finish(fallbackId, { status: 'error', processingError: error.message });
                     trace = this.host.traceCapture?.register(attempt);
                     fallbackId = trace ? null : startFallback(attempt.input);
-                    metric.inputChars += attempt.system.length + attempt.input.length;
+                    metric.inputChars += attempt.system.length + attempt.input.length + wrapChars;
                 };
                 const accepted = client instanceof AgentClient
                     ? await untilAborted(client.complete({ ...request, validate, onAttempt }), request.signal)
@@ -283,6 +291,7 @@ export class Controller {
     /** Worldbook-only mode: agents and injection see no summary, events or
      * inventory. Stored data is kept, so switching back restores them. */
     #taskView(save) {
+        if (save && !this.#worldbookOnly() && this.settings.summaryMode === 'rewrite') return { ...save, summaryRewrite: true };
         if (!this.#worldbookOnly() || !save) return save;
         const view = clone(save);
         view.worldbookOnly = true;
@@ -319,7 +328,46 @@ export class Controller {
         return yielded;
     }
     #preset() { return presetSnapshot(this.host.readPreset?.() ?? {}); }
-    #auxiliaryPreferences() { return selectedPreferences(this.store?.state.preferences?.preset, this.#preset()); }
+    #auxiliaryPreferences() { if (this.store?.state.preferences?.presetApplication) return []; return selectedPreferences(this.store?.state.preferences?.preset, this.#preset()); }
+    #application() { return applicationSnapshot(this.host.readPreset?.() ?? {}); }
+    #applicationEntries() { return selectedApplicationEntries(this.store?.state.preferences?.presetApplication, this.#application()); }
+    async scanPresetApplication() {
+        invariant(this.store && !this.view().activity, '请等待存档载入及当前任务完成');
+        const preset = this.#application(), store = this.store, bookName = this.host.snapshot().bookName;
+        invariant(store.state.bookName === bookName, '请等待当前世界书载入');
+        invariant(preset.entries.length, '当前没有可读取的预设文本条目');
+        const activity = this.#beginActivity('preferences', '正在推荐预设开关');
+        this.#state('正在扫描预设；原设置保留');
+        try {
+            const selectedIds = await this.client.completeValidated({ purpose: 'preferences', system: APPLICATION_SCAN, input: { entries: preset.entries }, signal: activity.signal }, result => {
+                this.#assertActivity(activity);
+                invariant(this.store === store && this.host.snapshot().bookName === bookName && this.#application().fingerprint === preset.fingerprint, '扫描期间预设或世界书已改变，请重新扫描');
+                return validateApplicationSelection(result, preset);
+            });
+            this.#assertActivity(activity);
+            this.#applicationDraft = { id: uid('preset-application'), chatId: activity.chatId, fingerprint: preset.fingerprint, selectedIds };
+            this.#state('已推荐预设开关，可手动调整后应用');
+        } catch (error) {
+            if (!activity.signal.aborted && activity.epoch === this.#epoch) this.#state('预设推荐未完成，已应用设置保留', error.message);
+            throw error;
+        } finally { this.#endActivity(activity); }
+    }
+    async savePresetApplication(ids, fingerprint, positions) {
+        invariant(this.store && !this.view().activity, '请等待存档载入及当前任务完成');
+        const epoch = this.#epoch, chatId = this.host.snapshot().chatId, store = this.store, bookName = this.host.snapshot().bookName;
+        invariant(store.state.bookName === bookName, '请等待当前世界书载入');
+        const preset = this.#application();
+        invariant(fingerprint === preset.fingerprint, '预设已改变，请重新检查条目');
+        const selectedIds = validateApplicationSelection({ selectedIds: ids }, preset);
+        const placement = validateApplicationPositions(positions, preset, selectedIds);
+        await store.idle();
+        this.#assertCurrent(epoch, chatId);
+        invariant(this.store === store && this.host.snapshot().bookName === bookName && this.#application().fingerprint === fingerprint && !this.view().activity, '预设或任务状态已改变，请重试');
+        await store.updatePreferences({ presetApplication: { name: preset.name, fingerprint, selectedIds, ...(Object.keys(placement).length ? { positions: placement } : {}) }, preset: null });
+        this.#assertCurrent(epoch, chatId);
+        this.#applicationDraft = null;
+        this.#state('预设副本已应用到此存档的辅助请求');
+    }
     async scanPreset() {
         invariant(this.store && !this.#initializing, '请先载入存档，并等待扫描完成');
         invariant(!this.view().activity, '请等待当前辅助任务完成后扫描预设');
@@ -579,7 +627,7 @@ export class Controller {
         return { apiVersion: 1, chatId, revision: save.revision, ...scopeRead(save, scopeId) };
     }
     view() {
-        const snapshot = this.host.snapshot(), preset = this.#preset();
+        const snapshot = this.host.snapshot(), preset = this.#preset(), application = this.#application();
         const activities = [...this.#activities.values()].filter(activity => activity.isCurrent())
             .sort((a, b) => Number(b.kind === 'select') - Number(a.kind === 'select') || b.startedAt - a.startedAt)
             .map(({ id, kind, label, startedAt, phase, cancellable, stopLabel, hint }) => ({ id, kind, label, startedAt, phase, cancellable, stopLabel, hint }));
@@ -593,6 +641,9 @@ export class Controller {
                     message: '旧记忆缺少逐楼阅读记录，无法确认的旧消息会保留原文。需要重新缩减历史时，请先备份聊天，再重新扫描。' }] : [])],
             enabled: this.#enabled(), saveEnabled: this.store?.state.preferences?.enabled !== false,
             activityClaimed: [...this.#activityClaims.values()].some(claim => claim.chatId === snapshot.chatId),
+            presetApplication: { ...application, saved: clone(this.store?.state.preferences?.presetApplication ?? null),
+                draft: clone(this.#applicationDraft), stale: Boolean(this.store?.state.preferences?.presetApplication
+                    && this.store.state.preferences.presetApplication.fingerprint !== application.fingerprint) },
             preset: { name: preset.name, available: Boolean(preset.entries.length),
                 stale: Boolean(this.store?.state.preferences?.preset && this.store.state.preferences.preset.fingerprint !== preset.fingerprint),
                 saved: clone(this.store?.state.preferences?.preset ?? null), draft: clone(this.#presetDraft) },
@@ -601,7 +652,8 @@ export class Controller {
             worldbookChecking: Boolean(this.#worldbookCheck && this.#worldbookCheck.target.chatId === snapshot.chatId && this.#worldbookCheck.target.bookName === snapshot.bookName),
             save: this.store?.state ? playerView(this.store.state) : null,
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
-            connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
+            connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', maxOutputTokens: this.#connectionConfig?.maxOutputTokens, hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
+            modelList: clone(this.#modelList),
             mvu: clone(this.mvu), diagnostics: { ...clone(this.diagnostics), memory: memoryMetrics(this.store?.state),
                 pendingCount: Math.max(0, this.host.snapshot().messages.length - (this.store?.state.processed.length ?? 0)) } };
     }
@@ -678,6 +730,7 @@ export class Controller {
         const currentChatId = this.host.snapshot().chatId;
         for (const [owner, claim] of this.#activityClaims) if (claim.chatId !== currentChatId) this.#activityClaims.delete(owner);
         this.#presetDraft = null;
+        this.#applicationDraft = null;
         this.sourceChanges = { changed: false, added: [], removed: [], updated: [] };
         this.#autoInitialization = null;
         this.#initializationSourceFingerprint = ''; this.#initializationContextFingerprint = ''; this.#initializationClassificationFingerprint = '';
@@ -760,13 +813,24 @@ export class Controller {
         }
         this.#state(reason);
     }
-    async updateConnection({ mode = 'raw', endpoint, model, apiKey }) {
+    /** Fill-in help for the separate connection. A blank key reuses the saved
+     * one only for the same endpoint, exactly as applying a connection does. */
+    async fetchModels({ endpoint, apiKey } = {}) {
+        const normalized = String(endpoint ?? '').trim().replace(/\/$/, '');
+        invariant(normalized, '请先填写接口基础地址');
+        const key = apiKey || (normalized === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '');
+        const models = await listModels({ endpoint: normalized, apiKey: key });
+        this.#modelList = { endpoint: normalized, models };
+        this.#notify();
+        return { executed: true, message: `已获取 ${models.length} 个模型，可在“从列表选择”里挑选` };
+    }
+    async updateConnection({ mode = 'raw', endpoint, model, apiKey, maxOutputTokens }) {
         invariant(!this.view().activity, '请先停止或等待当前任务完成，再应用连接；当前任务继续运行。');
         // Blank means retain the session key only for the same endpoint. Never
         // forward an existing credential when changing to a different server.
         const normalizedEndpoint = endpoint?.trim().replace(/\/$/, '');
         const retainedKey = normalizedEndpoint && normalizedEndpoint === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '';
-        const config = this.#applyConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey });
+        const config = this.#applyConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey, maxOutputTokens });
         try { this.connectionStore?.save?.(['raw', 'tavern'].includes(mode) ? null : { mode: 'compatible', ...config }); }
         catch { this.#state('连接已更新；本机保存失败，刷新后需重新填写'); this.readinessChanged(); return; }
         this.#state('连接已更新');
@@ -791,12 +855,14 @@ export class Controller {
         if ('mvuFields' in patch) next.mvuBookName = this.host.snapshot().bookName;
         invariant(Number.isInteger(next.recentTurns) && next.recentTurns >= 1 && next.recentTurns <= 1000, '保留轮数应为 1–1000');
         invariant(['full', 'worldbook'].includes(next.memoryMode), '记忆范围只能是完整记忆或仅动态世界书');
+        invariant(['append', 'rewrite'].includes(next.summaryMode), '脉络写法只能是追加或整段重写');
         invariant(Number.isInteger(next.scanConcurrency) && next.scanConcurrency >= 1 && next.scanConcurrency <= 6, '扫描并发数应为 1–6');
+        invariant(REASONING_EFFORTS.includes(next.auxReasoningEffort), '辅助思考强度无效');
         invariant(Number.isInteger(next.maintenanceEvery) && next.maintenanceEvery >= 1 && next.maintenanceEvery <= MAINTENANCE_EVERY_MAX, `自动维护间隔应为 1–${MAINTENANCE_EVERY_MAX} 次 AI 回复`);
         for (const key of ['timeoutMs', 'initializationTimeoutMs']) {
             invariant(validTimeout(next[key]), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
         }
-        for (const [key, min, max] of [['batchChars', 1, 200000], ['selectionLimit', 1, 200], ['selectionChars', 100, 200000], ['compactChars', 1000, 1000000], ['compactEvery', 1, 1000]]) {
+        for (const [key, min, max] of [['batchChars', 1, 200000], ['historyBatchChars', 1000, 400000], ['selectionLimit', 1, 200], ['selectionChars', 100, 200000], ['compactChars', 1000, 1000000], ['compactEvery', 1, 1000]]) {
             invariant(Number.isInteger(next[key]) && next[key] >= min && next[key] <= max, `${key} 超出允许范围`);
         }
         invariant(Array.isArray(next.mvuFields) && next.mvuFields.length <= 16 && next.mvuFields.every(field => typeof field.path === 'string' && typeof field.label === 'string'), 'MVU 最多配置16个字段，每项需有路径和名称');
@@ -857,14 +923,14 @@ export class Controller {
     #initializationInputs(store) {
         return { scopeContext: store.state.data.scopeContext, messageScopes: store.state.data.messageScopes,
             inventoryEnabled: store.state.data.inventoryEnabled, preferences: store.state.preferences,
-            presetFingerprint: this.#preset().fingerprint, batchChars: this.settings.batchChars,
+            presetFingerprint: this.#preset().fingerprint, applicationFingerprint: this.#application().fingerprint, batchChars: this.settings.batchChars,
             classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
     }
     #initializationRequestSettings(store) {
         return JSON.stringify(this.#classificationInputs(store));
     }
     #classificationInputs(store) {
-        return { preferences: store.state.preferences, presetFingerprint: this.#preset().fingerprint,
+        return { preferences: store.state.preferences, presetFingerprint: this.#preset().fingerprint, applicationFingerprint: this.#application().fingerprint,
             batchChars: this.settings.batchChars, classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
     }
     #initializationIdentity(store) {
@@ -916,7 +982,9 @@ export class Controller {
             const classificationFingerprint = await initializationFingerprint(this.#classificationInputs(targetStore));
             this.#initializationClassificationFingerprint = classificationFingerprint;
             const entries = raw.filter(e => !this.rules.configEntryUids.includes(e.uid)).map(e => makeSourceEntry(context.bookName, e));
-            const groups = batches(entries, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
+            // Disabled and pure-script entries are settled without a model call.
+            const { settled, pending } = prescan(entries);
+            const groups = batches(pending, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
             let checkpoint = targetStore.initializationCheckpoint();
             if (checkpoint?.sourceFingerprint !== sourceFingerprint || checkpoint?.inputFingerprint !== inputFingerprint
                 && checkpoint?.classificationFingerprint !== classificationFingerprint
@@ -925,7 +993,7 @@ export class Controller {
                 // A truncated/corrupt checkpoint must never certify missing or
                 // rewritten source entries merely because its header matches.
                 try {
-                    const restored = checkpoint.stage === 'history' ? Object.values(checkpoint.draft.base.entries) : checkpoint.classification.entries;
+                    const restored = checkpoint.stage === 'history' ? Object.values(checkpoint.draft.base.entries).filter(entry => !settled.has(entry.id)) : checkpoint.classification.entries;
                     const expected = groups.slice(0, checkpoint.classifiedBatches).flat();
                     const byId = new Map(restored.map(entry => [entry.id, entry]));
                     invariant(restored.length === expected.length && byId.size === expected.length && expected.every(source => {
@@ -981,12 +1049,14 @@ export class Controller {
                 await saveClassification();
                 launch();
             }
-            const ruled = applyRules(classified, this.compiledRules);
+            // A history-stage checkpoint already holds the settled entries.
+            const byId = new Map([...settled.values(), ...classified].map(entry => [entry.id, entry]));
+            const ruled = applyRules(entries.map(entry => byId.get(entry.id)).filter(Boolean), this.compiledRules);
             this.constraints = ruled.constraints;
             if (strategy === undefined) {
                 this.progress = { stage: '统合记忆策略', done: 0, total: 1 };
                 this.#updateActivity(activity, { label: '正在统合记忆策略' });
-                strategy = await alignStrategy(this.client, strategies, ruled.entries, this.rules.naturalLanguage, signal);
+                strategy = await alignStrategy(this.client, strategies, ruled.entries.filter(entry => entry.status !== DEFERRED), this.rules.naturalLanguage, signal);
                 checkpoint = { ...checkpoint, stage: 'strategy', strategy };
                 await saveClassification();
             }
@@ -1077,8 +1147,11 @@ export class Controller {
             if (runs.at(-1)?.[0].scopeId === message.scopeId) runs.at(-1).push(message);
             else runs.push([message]);
         }
-        const groups = runs.flatMap(run => batches(run, this.settings.batchChars));
-        let count = store.state.processed.length;
+        // Initialization reads long histories: each batch carries fixed memory
+        // overhead, so it uses larger batches than per-turn maintenance.
+        const limit = activity.kind === 'initialize' ? this.settings.historyBatchChars ?? this.settings.batchChars : this.settings.batchChars;
+        const groups = runs.flatMap(run => batches(run, limit));
+        let count = store.state.processed.length, condenseFailed = false;
         for (const batch of groups) {
             this.#assertActivity(activity);
             if (store === this.store) await this.#afterSelection(activity);
@@ -1095,20 +1168,70 @@ export class Controller {
                 this.#assertActivity(activity);
                 observedState = this.#observedState(projection, this.host.snapshot(), batch);
             }
-            const readable = batch.filter(isReadableMessage);
-            const result = readable.length ? await maintain(this.client, this.#taskView(this.#guarded(before)), readable, signal, scopeId, observedState,
-                candidate => this.#validateGuarded(before, candidate, readable.map(m => m.key), scopeId)) : { operations: [] };
-            this.#assertActivity(activity);
-            if (store === this.store) await this.#afterSelection(activity);
-            if (store === this.store) await this.#assertSourceCurrent(activity);
-            if (!isPrefix(keys.slice(0, count + batch.length), this.host.snapshot().messages.map(message => message.key))) {
-                throw Object.assign(new Error('当前剧情候选已变化，旧整理结果不再提交'), { dwmInitializationPathChanged: store !== this.store });
-            }
-            this.#validateGuarded(before, result, readable.map(m => m.key), scopeId);
+            const readable = batch.filter(isReadableMessage), evidence = readable.map(m => m.key);
+            const view = this.#taskView(this.#guarded(before));
+            const assertPath = async end => {
+                this.#assertActivity(activity);
+                if (store === this.store) await this.#afterSelection(activity);
+                if (store === this.store) await this.#assertSourceCurrent(activity);
+                if (!isPrefix(keys.slice(0, end), this.host.snapshot().messages.map(message => message.key))) {
+                    throw Object.assign(new Error('当前剧情候选已变化，旧整理结果不再提交'), { dwmInitializationPathChanged: store !== this.store });
+                }
+            };
+            // Large memories send only the entries this batch touches in full.
+            const result = readable.length ? await maintain(this.client, view, readable, signal, scopeId, observedState,
+                candidate => this.#validateGuarded(before, candidate, evidence, scopeId), { focus: maintenanceFocus(view, scopeId, readable) }) : { operations: [] };
+            await assertPath(count + batch.length);
+            this.#validateGuarded(before, result, evidence, scopeId);
             count += batch.length;
             await this.#saveActivity(activity, () => store.commit(result, { expectedRevision: before.revision, sourceKeys: keys.slice(0, count),
-                allowedEvidence: readable.map(m => m.key), maxChars: this.#maxChars(before), scopeId }));
+                allowedEvidence: evidence, maxChars: this.#maxChars(before), scopeId }));
             this.#assertActivity(activity);
+            if (result.needEntries?.length) await this.#maintainFollowUp(store, readable, keys.slice(0, count), result.needEntries, { signal, activity, scopeId, assertPath: () => assertPath(count) });
+            if (!condenseFailed && !this.#worldbookOnly() && scopeSummary(store.state.data, scopeId).length >= SUMMARY_COMPACT_CHARS) {
+                condenseFailed = !await this.#condenseSummary(store, scopeId, { signal, activity });
+            }
+        }
+    }
+    /** Entries the first pass saw only in the catalog get one targeted pass.
+     * The batch itself is already committed; a failure here costs only these updates. */
+    async #maintainFollowUp(store, readable, sourceKeys, ids, { signal, activity, scopeId, assertPath }) {
+        const before = store.snapshot(), evidence = readable.map(m => m.key);
+        try {
+            const view = this.#taskView(this.#guarded(before));
+            const result = await maintain(this.client, view, readable, signal, scopeId, null,
+                candidate => this.#validateGuarded(before, candidate, evidence, scopeId), { focus: new Set(ids), followUp: true });
+            await assertPath();
+            if (!result.operations.length) return;
+            this.#validateGuarded(before, result, evidence, scopeId);
+            await this.#saveActivity(activity, () => store.commit(result, { expectedRevision: before.revision, sourceKeys,
+                allowedEvidence: evidence, maxChars: this.#maxChars(before), scopeId }));
+            this.#assertActivity(activity);
+        } catch (error) {
+            this.#assertActivity(activity);
+            if (signal?.aborted || error.name === 'AbortError' || error.dwmInitializationPathChanged || error.dwmYielded) throw error;
+            console.warn('[鱼忆] 补充条目更新未完成，本批其余结果已保存', error);
+        }
+    }
+    /** The running summary only grows during maintenance; rewrite it once it
+     * passes the threshold so later batches stay small. Returns false on failure. */
+    async #condenseSummary(store, scopeId, { signal, activity }) {
+        const before = store.snapshot();
+        try {
+            const result = await compact(this.client, this.#guarded(before), signal, scopeId, { summaryOnly: true });
+            this.#assertActivity(activity);
+            result.operations = result.operations.filter(op => op.type === 'summary');
+            if (!result.operations.length) return false;
+            this.#validateGuarded(before, result, [], scopeId);
+            await this.#saveActivity(activity, () => store.commit(result, { expectedRevision: before.revision, sourceKeys: before.processed,
+                allowedEvidence: [], maxChars: this.#maxChars(before), reason: 'compact', scopeId }));
+            this.#assertActivity(activity);
+            return true;
+        } catch (error) {
+            this.#assertActivity(activity);
+            if (signal?.aborted || error.name === 'AbortError' || error.dwmYielded) throw error;
+            console.warn('[鱼忆] 常驻脉络整理未完成，稍后重试', error);
+            return false;
         }
     }
     #maxChars(save) {
@@ -1194,12 +1317,12 @@ export class Controller {
         const inspect = () => this.host.previewSnapshot?.() ?? this.host.snapshot();
         const snapshot = inspect(), epoch = this.#epoch;
         invariant(snapshot.chatId && snapshot.bookName, '请先打开带主世界书的角色聊天');
-        const save = this.store?.snapshot() ?? null, settings = clone(this.settings), presetFingerprint = this.#preset().fingerprint;
+        const save = this.store?.snapshot() ?? null, settings = clone(this.settings), presetFingerprint = this.#preset().fingerprint, applicationFingerprint = this.#application().fingerprint;
         const unchanged = () => {
             const latest = inspect();
             invariant(epoch === this.#epoch && latest.chatId === snapshot.chatId && latest.bookName === snapshot.bookName
                 && JSON.stringify(latest.messages) === JSON.stringify(snapshot.messages) && latest.userInput === snapshot.userInput
-                && this.store?.state?.revision === save?.revision && JSON.stringify(this.settings) === JSON.stringify(settings) && this.#preset().fingerprint === presetFingerprint,
+                && this.store?.state?.revision === save?.revision && JSON.stringify(this.settings) === JSON.stringify(settings) && this.#preset().fingerprint === presetFingerprint && this.#application().fingerprint === applicationFingerprint,
             '读取期间存档、输入或资料有变化，请刷新预览');
         };
         // Read rules locally: no reconcile, clearPlan, initialization, trace or model call.
@@ -1231,9 +1354,15 @@ export class Controller {
         if (sourceChanged) { narration.status = 'unavailable'; narration.explanation = sourceWarning; }
         else if (!currentSave && save?.initialized) narration.explanation = '保存快照不属于当前聊天或所选剧情；实际发送会先载入或回放，当前不展示旧片段。';
         for (const stage of result.stages) {
-            if (stage.input) { const adapted = applyAuxiliaryPreferences({ system: stage.system, input: stage.input }, this.#auxiliaryPreferences()); stage.system = adapted.system; stage.input = adapted.input; }
+            if (stage.input) {
+                const adapted = applyPresetApplication(applyAuxiliaryPreferences({ system: stage.system, input: stage.input }, this.#auxiliaryPreferences()), this.#applicationEntries());
+                stage.system = adapted.system; stage.input = adapted.input;
+                if (adapted.head) stage.head = adapted.head;
+                if (adapted.tail) stage.tail = adapted.tail;
+            }
         }
-        if (save?.preferences?.preset && save.preferences.preset.fingerprint !== this.#preset().fingerprint) result.warnings.push('当前预设已改变，旧辅助偏好暂不采用；请在设置中重新扫描并确认。');
+        if (save?.preferences?.preset && save.preferences.preset.fingerprint !== this.#preset().fingerprint) result.warnings.push('当前预设已改变，旧辅助偏好暂不采用；请在预设应用中重新检查并确认。');
+        if (save?.preferences?.presetApplication && save.preferences.presetApplication.fingerprint !== applicationFingerprint) result.warnings.push('预设已改变，旧预设副本暂不应用；请到预设应用重新确认。');
         result.stages.unshift(narration);
         result.warnings.push('预览按普通发送与点击刷新时的输入草稿计算；重生成、续写、宏展开、原生预算和第三方处理可能改变最终请求。实际发送仍以“实际记录”为准。');
         if (save && !isPrefix(save.processed, snapshot.messages.map(m => m.key))) result.warnings.push('当前候选回复与已存记忆路径不一致；实际发送会先校正记忆，下列内容暂按保存快照展示。');
@@ -1428,6 +1557,12 @@ export class Controller {
                 const sameText = (used ?? old).source.original === (entry.content ?? '');
                 const sameMeta = JSON.stringify((used ?? old).source.metadata) === JSON.stringify(entry);
                 if (sameText && sameMeta && old.source.original === used?.source.original) continue;
+                if (sameText && used?.status === DEFERRED && !entry.disable) {
+                    // Skipped while disabled at scan time; classify now that it is on.
+                    classify.push(makeSourceEntry(book, entry));
+                    textChanged.set(sourceId(book, entry.uid), { used, old: null });
+                    continue;
+                }
                 if (sameText) {
                     // Metadata only (keys, order, toggles): no model call.
                     const refresh = item => item && createEntry({ ...item, title: entry.comment || item.title, enabled: !entry.disable, constant: entry.constant,
@@ -1440,8 +1575,9 @@ export class Controller {
                 const derived = baseline.get(uid)?.source.original === used?.source.original ? baseline.get(uid) : null;
                 textChanged.set(sourceId(book, entry.uid), { used, old: derived });
             }
-            const classified = [];
-            const groups = batches(classify, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
+            const { settled, pending } = prescan(classify);
+            const classified = [...settled.values()];
+            const groups = batches(pending, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
             for (let i = 0; i < groups.length; i++) {
                 this.#updateActivity(activity, { label: `扫描变化条目 ${i + 1}/${groups.length}` });
                 const result = await classifyEntries(this.client, groups[i], this.rules.naturalLanguage, signal);
@@ -1449,6 +1585,8 @@ export class Controller {
                 classified.push(...result.entries);
             }
             const ruled = applyRules(classified, this.compiledRules).entries;
+            // Same baseline as initialization, so "恢复原书" restores this classification.
+            for (const entry of ruled) if (entry.source && entryText(entry) === entry.source.original) entry.source.baselineSegments = clone(entry.segments);
             const merges = [];
             for (const next of ruled) {
                 const change = textChanged.get(next.id);

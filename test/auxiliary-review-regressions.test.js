@@ -22,11 +22,19 @@ const request = { purpose: 'select', system: '固定任务', input: {} };
 test('native auxiliary generation preserves a higher configured output budget and reasoning settings', async () => {
     const settings = { openai_max_tokens: 32768, reasoning_effort: 'max', show_thoughts: true };
     const f = nativeFixture({ settings });
-    await new AgentClient(f.generate).complete(request);
+    await new AgentClient(f.generate, { getTimeouts: () => ({ auxReasoningEffort: 'inherit' }) }).complete(request);
     assert.equal(f.calls[0].max_tokens, 32768);
     assert.equal(f.settingsSeen[0].reasoning_effort, 'max');
     assert.deepEqual(settings, { openai_max_tokens: 32768, reasoning_effort: 'max', show_thoughts: true });
     assert.equal(Object.hasOwn(f.calls[0], 'n'), false, 'quiet builders may deliberately omit n');
+});
+
+test('auxiliary tasks default to low thinking effort without touching the story preset', async () => {
+    const settings = { openai_max_tokens: 32768, reasoning_effort: 'high' };
+    const f = nativeFixture({ settings });
+    await new AgentClient(f.generate).complete(request);
+    assert.equal(f.settingsSeen[0].reasoning_effort, 'low');
+    assert.equal(settings.reasoning_effort, 'high');
 });
 
 test('task budgets grow with selected identifiers and stay within a conservative unknown-model limit', () => {
@@ -80,12 +88,12 @@ test('compatible reasoning models keep the provider default unless the player se
         assert.equal(body.max_completion_tokens, undefined, model);
     }
     for (const model of ['gpt-5', 'o3-mini', 'openai/gpt-5', 'gpt-6-astra']) {
-        assert.equal((await send(model, { maxOutputTokens: 12000 })).max_completion_tokens, 2048, model);
+        assert.equal((await send(model, { maxOutputTokens: 12000 })).max_completion_tokens, 12000, model);
     }
-    assert.equal((await send('deepseek-reasoner', { maxOutputTokens: 12000 })).max_tokens, 2048);
+    assert.equal((await send('deepseek-reasoner', { maxOutputTokens: 12000 })).max_tokens, 12000);
     for (const model of ['gpt-4.1', 'other', 'deepseek-chat']) {
         const body = await send(model);
-        assert.equal(body.max_tokens, 2048, model);
+        assert.equal(body.max_tokens, undefined, model);
         assert.equal(body.max_completion_tokens, undefined, model);
     }
 });

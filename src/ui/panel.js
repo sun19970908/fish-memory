@@ -1,4 +1,3 @@
-import { preferenceLabel } from '../agents/preset-preferences.js';
 import { buildRuleDocument, compileRules, formToScript } from '../rules/index.js';
 import { diffText } from './diff.js';
 import { createTraceViewer } from './trace-viewer.js';
@@ -32,9 +31,10 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     let mobileDetail = false, entryMode = 'read', visibleCount = 80, composing = false, queuedRender = false;
     let ruleNL = '', ruleScript = '', ruleOutput = '', ruleMatch = { field: 'title', op: 'contains', value: '', action: 'lock', limit: '' };
     let recentTurnsDraft = null, timeoutDraft = null, cadenceDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
-    let localPreview = null, presetSelection = new Set(), presetDraftKey = null;
+    let localPreview = null;
+    let applicationSelection = new Set(), applicationPositions = {}, applicationKey = null;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
-    const connectionDraft = { endpoint: '', model: '', apiKey: '' };
+    const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined };
     const h = (tag, className = '', content) => {
         const el = doc.createElement(tag);
         if (className) el.className = className;
@@ -178,7 +178,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         shell.append(state);
         if (view.activity) shell.append(activityIndicator.element);
         const nav = h('nav', 'dwm-tabs'); nav.setAttribute('aria-label', '鱼忆工作台'); nav.setAttribute('role', 'tablist');
-        const tabs = [['library', '资料'], ['round', '本轮'], ['activity', '维护与记录'], ['settings', '设置'], ['traces', '收发']];
+        const tabs = [['library', '资料'], ['round', '本轮'], ['activity', '维护与记录'], ['settings', '设置'], ['preset', '预设应用'], ['traces', '收发']];
         tabs.forEach(([id, title], index) => {
             const b = button(title, () => navigate(id), { navigation: true, key: `tab-${id}`, className: tab === id ? 'dwm-active-tab' : '' });
             b.id = `${panelId}-tab-${id}`; b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', String(tab === id)); b.setAttribute('aria-controls', `${panelId}-content`); b.tabIndex = tab === id ? 0 : -1;
@@ -203,6 +203,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (tab === 'round') renderRound(content, view);
         if (tab === 'activity') renderActivity(content, view);
         if (tab === 'settings') renderSettings(content, view);
+        if (tab === 'preset') renderPresetApplication(content, view);
         if (tab === 'traces') {
             const modes = h('div', 'dwm-segments dwm-diagnostics-modes');
             for (const [id, label] of [['actual', '实际记录'], ['preview', '发送前预览']]) {
@@ -241,7 +242,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         renderWorldbookCheck(panel, view);
         if (view.initialization?.message) panel.append(h('p', view.initialization.retry ? 'dwm-warning' : 'dwm-muted', view.initialization.message));
         if (view.initializationResume) panel.append(h('p', 'dwm-notice', `已有扫描进度：世界书 ${view.initializationResume.classifiedBatches}/${view.initializationResume.totalBatches} 批，历史 ${view.initializationResume.processedCount} 条。再次扫描会先核对资料，继续仍有效的进度。`));
-        if (view.preset?.available) panel.append(h('p', 'dwm-muted', '预设偏好可在设置中单独扫描，不影响建立记忆。'));
+        if (view.preset?.available) panel.append(h('p', 'dwm-muted', '预设可在“预设应用”中选择或扫描推荐，不影响建立记忆。'));
         panel.append(row(button(view.initialization?.retry ? '手动扫描 / 重试初始化' : '建立此存档记忆', () => initialize(view), { primary: true, disabled: !view.save || Boolean(view.progress) || Boolean(view.activity) || Object.values(readiness).some(value => value === false) }), button('设置辅助模型', () => navigate('settings'), { navigation: true })));
         if (view.progress) panel.append(h('p', 'dwm-warning', '扫描中继续发送将走酒馆原生流程；新增剧情会在扫描后补记。'));
         if (view.connectionMode === 'test') panel.append(h('p', 'dwm-muted', '本页使用模拟模型，不会调用真实 API。'));
@@ -273,7 +274,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
             item.setAttribute('aria-current', entry.id === selected ? 'true' : 'false');
             const meta = h('div', 'dwm-entry-meta'); meta.append(h('span', '', KIND_NAMES[entry.kind] ?? entry.kind));
             if (entry.needsReview) meta.append(h('span', 'dwm-review-label', '待核对'));
-            else if (!entry.enabled) meta.append(h('span', '', '已停用'));
+            else if (!entry.enabled) meta.append(h('span', '', entry.status === 'deferred' ? '已停用 · 启用后扫描' : '已停用'));
             else if (entry.constant || entry.important) meta.append(h('span', '', '常驻'));
             item.append(meta, h('strong', '', entry.title || '未命名条目'), h('span', 'dwm-entry-intro', entry.intro || '暂无简介')); list.append(item);
         }
@@ -317,7 +318,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const back = button('返回资料列表', () => { mobileDetail = false; render(); container.querySelector('[data-focus="entry-search"]')?.focus({ preventScroll: true }); }, { navigation: true, className: 'dwm-mobile-back' }); parent.append(back);
         const meta = h('div', 'dwm-entry-heading-meta'); meta.append(badge(KIND_NAMES[entry.kind] ?? entry.kind));
         meta.append(badge(entry.constant ? '蓝灯 · 常驻' : entry.important ? '重要人物 · 常驻' : '前置按需选材'));
-        if (!entry.enabled) meta.append(badge('已停用'));
+        if (!entry.enabled) meta.append(badge(entry.status === 'deferred' ? '已停用 · 原书启用后同步即扫描' : '已停用'));
         if (entry.needsReview) meta.append(badge('待核对', 'dwm-review-badge'));
         parent.append(meta);
         const title = h('h3', 'dwm-entry-title', entry.title || '未命名条目'); title.tabIndex = -1; title.dataset.detailHeading = 'true'; parent.append(title);
@@ -493,6 +494,15 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         usage.append(modeChoice.wrap, h('p', 'dwm-muted', current.memoryMode === 'worldbook'
             ? '仅动态世界书：只更新已有条目，不新增条目或晋升人物；不再维护和发送故事脉络、事件与物品，历史窗口不省略原文；已有资料保留，切回完整记忆即可继续使用。'
             : '想只用动态世界书、关掉脉络与事件记忆时，可在这里切换。'));
+        if (current.memoryMode !== 'worldbook') {
+            const rewrite = (current.summaryMode ?? DEFAULT_SETTINGS.summaryMode) === 'rewrite';
+            usage.append(selectField('故事脉络写法', rewrite ? 'rewrite' : 'append',
+                [['append', '追加（默认）：每批只写新增的一段'], ['rewrite', '整段重写：每批把整段脉络重写一遍']],
+                value => call(() => controller.updateSettings({ summaryMode: value }), value === 'rewrite' ? '已改为整段重写，从下一次整理生效' : '已改为追加，从下一次整理生效')).wrap,
+            h('p', 'dwm-muted', rewrite
+                ? '整段重写：脉络始终是一段连贯的概述，但每批都要输出完整脉络，长聊天扫描和后台整理明显更慢、更费 token。'
+                : '追加：每批只写新增的一小段，扫描和后台整理更快、更省；两次整理之间脉络像按时间往后记的记录，超过 8000 字时自动整理成连贯概述。'));
+        }
         usage.append(toggle('由鱼忆管理历史窗口', Boolean(current.windowEnabled), '只在当次发送中省略已记入且超出近期范围的原文，不写入持久隐藏。与其他自动隐藏工具请只启用一方。', value => call(() => controller.updateSettings({ windowEnabled: value }))));
         if (view.window) usage.append(h('p', 'dwm-muted', `${Number.isInteger(view.window.omittedCount) ? `本轮已省略 ${view.window.omittedCount} 条旧原文。` : ''}${view.window.reason || ''}`));
         const rounds = field('保留最近几轮完整对话', recentTurnsDraft ?? current.recentTurns ?? 12, value => { recentTurnsDraft = value; }, { type: 'number' }); rounds.input.min = '1'; rounds.input.max = '1000';
@@ -527,9 +537,13 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         concurrency.append(selectField('同时扫描的批数', String(current.scanConcurrency ?? DEFAULT_SETTINGS.scanConcurrency),
             [['1', '1 批（逐批）'], ['2', '2 批'], ['3', '3 批（默认）'], ['4', '4 批'], ['6', '6 批']],
             value => call(() => controller.updateSettings({ scanConcurrency: Number(value) }), '扫描速度已保存')).wrap);
+        concurrency.append(selectField('辅助任务思考强度', current.auxReasoningEffort ?? DEFAULT_SETTINGS.auxReasoningEffort,
+            [['low', '低（默认，最快）'], ['medium', '中'], ['high', '高'], ['auto', '交给模型自动'], ['inherit', '沿用酒馆预设']],
+            value => call(() => controller.updateSettings({ auxReasoningEffort: value }), '思考强度已保存')).wrap);
+        concurrency.append(h('p', 'dwm-muted', '扫描、选材和整理用不着深度思考，思考越多越慢、越贵。只影响鱼忆的辅助请求，不改正文的设置；模型不支持调节时此项无效。'));
         parent.append(concurrency);
         renderTimeouts(parent, current);
-        renderPreset(parent, view);
+
         renderConnection(parent, view);
         renderMvu(parent, view);
         const binding = details('世界书检查', 'worldbook-check'); renderWorldbookCheck(binding, view); parent.append(binding);
@@ -555,47 +569,74 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         }, '等待时间已保存，从下一次辅助请求生效')));
         parent.append(panel);
     }
-    function renderPreset(parent, view) {
-        const preset = view.preset ?? {}, panel = card('辅助 Agent 的预设偏好', '只采用语言、专名、术语和称谓。叙事、变量更新、输出协议、工具权限及绕过安全限制的条目不继承；原预设不会改动。');
-        panel.append(h('p', 'dwm-muted', `当前预设：${preset.name || '尚不可读取'}`));
-        if (preset.stale) panel.append(h('p', 'dwm-warning', '预设已经改变，旧偏好暂不使用；请重新扫描并确认。'));
-        if (preset.saved?.selected?.length) {
-            const saved = details('已确认的辅助偏好与来源', 'saved-preset');
-            for (const item of preset.saved.selected) saved.append(h('p', '', `${preferenceLabel(item.preference)} · 来源：${item.source.title}`));
-            panel.append(saved);
+    function renderPresetApplication(parent, view) {
+        const preset = view.presetApplication ?? { entries: [] };
+        const draft = preset.draft?.fingerprint === preset.fingerprint ? preset.draft : null;
+        const key = `${view.chatId ?? ''}:${view.save?.id ?? ''}:${preset.fingerprint}:${draft?.id ?? 'saved'}`;
+        if (applicationKey !== key) {
+            applicationKey = key;
+            applicationSelection = new Set(draft?.selectedIds ?? (preset.stale ? [] : preset.saved?.selectedIds) ?? []);
+            applicationPositions = { ...(preset.stale ? {} : preset.saved?.positions ?? {}) };
         }
-        panel.append(button('扫描当前预设（调用模型）', () => call(() => controller.scanPreset()), { disabled: !view.save || !preset.available || Boolean(view.activity) }));
-        if (!preset.available) panel.append(h('p', 'dwm-muted', '当前仅支持读取酒馆聊天补全预设中已启用的文本条目。没有可读条目时继续使用鱼忆自身提示词。'));
-        const draft = preset.draft;
-        if (draft) {
-            const key = draft.id || `${draft.chatId}:${draft.fingerprint}:${draft.candidates.map(item => item.id).join(',')}`;
-            if (presetDraftKey !== key) { presetDraftKey = key; presetSelection = new Set(); }
-            panel.append(h('p', 'dwm-muted', '扫描结果尚未采用。勾选并确认后，仅保存到当前存档。'));
-            for (const item of draft.candidates) {
-                const candidate = h('div', 'dwm-preset-candidate');
-                candidate.append(toggle(preferenceLabel(item.preference), presetSelection.has(item.id), `来源：${item.source.title}`, value => { if (value) presetSelection.add(item.id); else presetSelection.delete(item.id); })); panel.append(candidate);
+        const panel = card('预设应用', '为鱼忆选择当前预设中的文本条目。仅影响此存档的辅助请求，不改酒馆正文的预设开关。');
+        panel.append(h('p', 'dwm-muted', `当前预设：${preset.name || '尚不可读取'} · ${preset.entries.length} 个文本条目`));
+        const scopeNote = details('哪些内容会应用？', 'preset-scope-note');
+        scopeNote.append(h('p', 'dwm-muted', '选中的条目按原文和原角色包住鱼忆的任务：“头部”放在任务之前，“尾部”放在任务输入之后、整个请求的最后。默认沿用预设本身的位置：排在聊天记录之后或按深度插入的条目算尾部，其余算头部，可逐条改。角色卡、聊天历史等占位块不在此处；脚本不执行，宏占位符保留原文。尾部条目离输出最近，若要求写正文或改变输出格式，可能让辅助任务失败。条目越多，每次辅助请求的输入开销越大。'));
+        panel.append(scopeNote);
+        if (preset.stale) panel.append(h('p', 'dwm-warning', '原预设已变化，旧选择暂停应用。请重新检查并应用。'));
+        if (!preset.saved && view.preset?.saved?.selected?.length) panel.append(h('p', 'dwm-muted', '旧版已确认的语言偏好仍生效；应用这里的选择后会替换旧偏好。'));
+        const disabled = !view.save || Boolean(view.activity);
+        panel.append(button('扫描推荐开关（调用模型）', () => call(() => controller.scanPresetApplication()), { disabled: disabled || !preset.entries.length }));
+        panel.append(h('p', 'dwm-muted', draft ? '已生成推荐。你可以任意调整下面的开关，点“应用到辅助请求”后生效。' : '可直接手动选择，也可先扫描推荐。开关修改后需点击应用；未应用不会改变实际请求。'));
+        panel.append(row(button('沿用原预设开关', () => { applicationSelection = new Set(preset.entries.filter(e => e.enabled).map(e => e.id)); render(); }, { disabled }),
+            button('全部关闭', () => { applicationSelection = new Set(); render(); }, { disabled })));
+        panel.append(h('p', 'dwm-muted', `当前勾选 ${applicationSelection.size} 条；已应用 ${preset.stale ? 0 : preset.saved?.selectedIds?.length ?? 0} 条。`));
+        if (!preset.entries.length) panel.append(h('p', 'dwm-muted', '当前没有可读取的聊天补全预设文本条目。仍可照常使用鱼忆。'));
+        for (const entry of preset.entries) {
+            const item = h('div', 'dwm-preset-candidate');
+            const recommended = draft ? (draft.selectedIds.includes(entry.id) ? '扫描推荐开启' : '扫描推荐关闭') : '';
+            item.append(toggle(entry.title, applicationSelection.has(entry.id), `原预设：${entry.enabled ? '开启' : '关闭'}${recommended ? ` · ${recommended}` : ''}`, value => {
+                if (value) applicationSelection.add(entry.id); else applicationSelection.delete(entry.id); render();
+            }));
+            if (applicationSelection.has(entry.id)) {
+                const position = applicationPositions[entry.id] ?? entry.position ?? 'head';
+                const label = value => `${value === 'head' ? '头部（任务之前）' : '尾部（请求最后）'}${value === entry.position ? ' · 预设原位置' : ''}`;
+                item.append(selectField('插入位置', position, [['head', label('head')], ['tail', label('tail')]], value => {
+                    if (value === entry.position) delete applicationPositions[entry.id]; else applicationPositions[entry.id] = value; render();
+                }, `preset-position-${entry.id}`).wrap);
             }
-            if (!draft.candidates.length) panel.append(h('p', 'dwm-muted', '没有找到可直接复用的通用约定；不影响记忆功能。'));
-            panel.append(button('确认所选偏好', () => call(() => controller.confirmPreset([...presetSelection])), { disabled: Boolean(view.activity) }));
+            const source = details('查看条目原文', `preset-entry-${entry.id}`);
+            source.append(h('pre', 'dwm-preset-source', entry.content)); item.append(source); panel.append(item);
         }
+        panel.append(button('应用到辅助请求', () => call(async () => {
+            await controller.savePresetApplication([...applicationSelection], preset.fingerprint,
+                Object.fromEntries(Object.entries(applicationPositions).filter(([id]) => applicationSelection.has(id))));
+            applicationKey = null;
+        }, '已应用，可在“收发”核对提示预览与实际请求'), { disabled }));
         parent.append(panel);
     }
     function renderConnection(parent, view) {
         const panel = card('辅助模型连接', '用于扫描、选材与维护。单独连接（含密钥）会保存在本浏览器，刷新后继续使用；换浏览器或清除站点数据后需重新填写。');
         if (!connectionDraft.endpoint && view.connection?.endpoint) connectionDraft.endpoint = view.connection.endpoint;
         if (!connectionDraft.model && view.connection?.model) connectionDraft.model = view.connection.model;
+        if (connectionDraft.maxOutputTokens === undefined) connectionDraft.maxOutputTokens = view.connection?.maxOutputTokens ?? '';
         if (view.connectionMode === 'test') { panel.append(h('p', 'dwm-notice', '演示模式 · 当前使用模拟模型，没有真实 API 请求。')); parent.append(panel); return; }
         const mode = connectionModeDraft ?? view.connectionMode?.mode ?? view.connectionMode ?? 'raw';
         panel.append(h('p', 'dwm-muted', `当前生效：${view.connectionMode === 'compatible' ? `单独接口 · ${view.connection?.model || '未指定模型'}` : '沿用酒馆连接'}。下方修改在应用后生效。`));
         const modeField = selectField('连接方式', mode, [['raw', '沿用酒馆连接'], ['compatible', '单独的兼容接口']], value => { connectionModeDraft = value; render(); }); panel.append(modeField.wrap);
         if (mode === 'compatible') {
             panel.append(field('接口基础地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '鱼忆会在地址后添加 /chat/completions。' }).wrap,
-                field('模型名称', connectionDraft.model, value => { connectionDraft.model = value; }).wrap,
-                field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: view.connection?.hasApiKey ? '已保存密钥；地址不变时留空可继续使用。更换地址需重新填写。' : '只用于本次连接，不写入存档。' }).wrap);
+                field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: view.connection?.hasApiKey ? '已保存密钥；地址不变时留空可继续使用。更换地址需重新填写。' : '只用于本次连接，不写入存档。' }).wrap,
+                field('模型名称', connectionDraft.model, value => { connectionDraft.model = value; }, { hint: '可直接填写，或先点“获取模型列表”再从列表选择。' }).wrap,
+                button('获取模型列表', () => call(() => controller.fetchModels({ endpoint: connectionDraft.endpoint, apiKey: connectionDraft.apiKey }), '已获取模型列表')));
+            const listed = view.modelList?.endpoint === connectionDraft.endpoint.trim().replace(/\/$/, '') ? view.modelList.models : [];
+            if (listed.length) panel.append(selectField('从列表选择', listed.includes(connectionDraft.model) ? connectionDraft.model : '',
+                [['', `共 ${listed.length} 个模型，选择后填入模型名称`], ...listed.map(id => [id, id])], value => { if (value) { connectionDraft.model = value; render(); } }, 'model-list').wrap);
+            panel.append(field('辅助输出额度（token，可留空）', connectionDraft.maxOutputTokens, value => { connectionDraft.maxOutputTokens = value; }, { type: 'number', hint: '留空沿用服务端默认值。思考也可能占用额度；截断时可按模型支持范围填写更大值，如 32768。较大额度可能增加费用，应用连接后生效。' }).wrap);
         }
         if (view.activity) panel.append(h('p', 'dwm-muted', '任务正在运行，请先停止或等待完成，再应用连接。'));
         panel.append(button('应用连接', () => call(async () => {
-            await controller.updateConnection({ mode, endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey }); connectionDraft.apiKey = ''; connectionModeDraft = null;
+            await controller.updateConnection({ mode, endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey, maxOutputTokens: connectionDraft.maxOutputTokens }); connectionDraft.apiKey = ''; connectionModeDraft = null;
         }, '连接已应用；下一次辅助任务将使用此连接'), { disabled: Boolean(view.activity) })); parent.append(panel);
     }
     function renderMvuState(parent, state = {}) {
